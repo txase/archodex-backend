@@ -1,10 +1,6 @@
 use std::{collections::HashMap, time::SystemTime};
 
-use axum::{
-    extract::{Path, Request},
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, middleware::Next, response::Response};
 use josekit::{
     JoseError,
     jwk::JwkSet,
@@ -14,7 +10,7 @@ use josekit::{
 use reqwest::header::AUTHORIZATION;
 use surrealdb::{Surreal, Uuid, engine::any::Any, sql::statements::CommitStatement};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{Instrument as _, error_span, info, instrument, warn};
 
 use crate::{
     Result,
@@ -25,7 +21,7 @@ use crate::{
 };
 use archodex_error::{
     anyhow::{Context as _, anyhow},
-    unauthorized,
+    not_found, unauthorized,
 };
 
 static JWK_SET: OnceCell<(JwkSet, HashMap<String, RsassaJwsVerifier>)> = OnceCell::const_new();
@@ -83,33 +79,94 @@ pub(crate) async fn jwks(
         .await
 }
 
-pub(crate) trait AccountAuth {
-    fn account_id(&self) -> Option<&String>;
-    async fn validate(&self, db: &Surreal<Any>) -> Result<()>;
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct DashboardAuth {
     principal: User,
-    account_id: Option<String>,
 }
 
 impl DashboardAuth {
+    pub(crate) async fn authenticate(mut req: Request, next: Next) -> Result<Response> {
+        let authorization = req.headers().get(AUTHORIZATION);
+        let dashboard_auth = async move {
+            let Some(authorization) = authorization else {
+                warn!("Missing Authorization header");
+                unauthorized!();
+            };
+
+            let Ok(authorization) = authorization.to_str() else {
+                warn!("Failed to parse Authorization header as string");
+                unauthorized!();
+            };
+
+            let Some(access_token) = authorization.strip_prefix("Bearer ") else {
+                warn!("Invalid Authorization header format");
+                unauthorized!();
+            };
+
+            let cognito_user_pool_id = Env::cognito_user_pool_id();
+            let cognito_client_id = Env::cognito_client_id();
+
+            let jwks_issuer =
+                format!("https://cognito-idp.us-west-2.amazonaws.com/{cognito_user_pool_id}");
+
+            let (jwk_set, verifier_map) = jwks(&jwks_issuer).await;
+
+            let user_id = match jwt::decode_with_verifier_in_jwk_set(access_token, jwk_set, |jwk| {
+                Ok(verifier_map
+                    .get(jwk.key_id().ok_or(JoseError::InvalidJwkFormat(anyhow!(
+                        "Cognito jwk missing 'kid' field"
+                    )))?)
+                    .map(|verifier| verifier as &dyn josekit::jws::JwsVerifier))
+            }) {
+                Ok((payload, _header)) => {
+                    let Some(josekit::Value::String(sub)) = payload.claim("sub") else {
+                        warn!("Missing or invalid sub claim in JWT");
+                        unauthorized!();
+                    };
+
+                    let mut validator = jwt::JwtPayloadValidator::new();
+
+                    validator.set_base_time(SystemTime::now());
+                    validator.set_issuer(&jwks_issuer);
+                    validator.set_claim("client_id", cognito_client_id.into());
+                    validator.set_claim("token_use", "access".into());
+
+                    match validator.validate(&payload) {
+                        Ok(()) => Result::Ok(sub.to_owned()),
+                        Err(err) => {
+                            warn!(?err, "Failed to validate JWT");
+                            unauthorized!();
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, "Failed to verify JWT");
+                    unauthorized!();
+                }
+            }?;
+
+            let user_id = Uuid::parse_str(&user_id)
+                .with_context(|| format!("Failed to parse user ID {user_id:?} as UUID"))?;
+
+            Result::Ok(DashboardAuth {
+                principal: User::new(user_id),
+            })
+        }
+        .instrument(error_span!("authenticate"))
+        .await?;
+
+        tracing::Span::current().record("auth", tracing::field::debug(&dashboard_auth));
+
+        req.extensions_mut().insert(dashboard_auth);
+
+        Ok(next.run(req).await)
+    }
+
     pub(crate) fn principal(&self) -> &User {
         &self.principal
     }
-}
 
-impl AccountAuth for DashboardAuth {
-    fn account_id(&self) -> Option<&String> {
-        self.account_id.as_ref()
-    }
-
-    async fn validate(&self, _db: &Surreal<Any>) -> Result<()> {
-        let Some(account_id) = &self.account_id else {
-            return Ok(());
-        };
-
+    pub(crate) async fn validate_account_access(&self, account_id: &str) -> Result<()> {
         if accounts_db()
             .await?
             .query(BeginReadonlyStatement)
@@ -124,104 +181,85 @@ impl AccountAuth for DashboardAuth {
         {
             warn!(
                 principal = ?self.principal,
-                account_id = account_id,
-                "Principal does not have access to account"
+                account_id,
+                "Account does not exist or principal does not have access to account"
             );
-            unauthorized!();
+            not_found!("Account not found");
         }
 
         Ok(())
     }
 }
 
-pub(crate) async fn dashboard_auth(
-    Path(params): Path<HashMap<String, String>>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response> {
-    let Some(authorization) = req.headers().get(AUTHORIZATION) else {
-        warn!("Missing Authorization header");
-        unauthorized!();
-    };
-
-    let Ok(authorization) = authorization.to_str() else {
-        warn!("Failed to parse Authorization header as string");
-        unauthorized!();
-    };
-
-    let Some(access_token) = authorization.strip_prefix("Bearer ") else {
-        warn!("Invalid Authorization header format");
-        unauthorized!();
-    };
-
-    let cognito_user_pool_id = Env::cognito_user_pool_id();
-    let cognito_client_id = Env::cognito_client_id();
-
-    let jwks_issuer = format!("https://cognito-idp.us-west-2.amazonaws.com/{cognito_user_pool_id}");
-
-    let (jwk_set, verifier_map) = jwks(&jwks_issuer).await;
-
-    let user_id = match jwt::decode_with_verifier_in_jwk_set(access_token, jwk_set, |jwk| {
-        Ok(verifier_map
-            .get(jwk.key_id().ok_or(JoseError::InvalidJwkFormat(anyhow!(
-                "Cognito jwk missing 'kid' field"
-            )))?)
-            .map(|verifier| verifier as &dyn josekit::jws::JwsVerifier))
-    }) {
-        Ok((payload, _header)) => {
-            let Some(josekit::Value::String(sub)) = payload.claim("sub") else {
-                warn!("Missing or invalid sub claim in JWT");
-                unauthorized!();
-            };
-
-            let mut validator = jwt::JwtPayloadValidator::new();
-
-            validator.set_base_time(SystemTime::now());
-            validator.set_issuer(&jwks_issuer);
-            validator.set_claim("client_id", cognito_client_id.into());
-            validator.set_claim("token_use", "access".into());
-
-            match validator.validate(&payload) {
-                Ok(()) => Result::Ok(sub.to_owned()),
-                Err(err) => {
-                    warn!("Failed to validate JWT: {err}");
-                    unauthorized!();
-                }
-            }
-        }
-        Err(err) => {
-            warn!("Failed to verify JWT: {err}");
-            unauthorized!();
-        }
-    }?;
-
-    let user_id = Uuid::parse_str(&user_id)
-        .with_context(|| format!("Failed to parse user ID {user_id:?} as UUID"))?;
-
-    info!("Authenticated as user ID {user_id}");
-
-    let account_id = params.get("account_id").cloned();
-
-    req.extensions_mut().insert(DashboardAuth {
-        principal: User::new(user_id),
-        account_id,
-    });
-
-    Ok(next.run(req).await)
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReportApiKeyAuth {
     account_id: String,
     key_id: u32,
 }
 
-impl AccountAuth for ReportApiKeyAuth {
-    fn account_id(&self) -> Option<&String> {
-        Some(&self.account_id)
+impl ReportApiKeyAuth {
+    pub(crate) async fn authenticate(mut req: Request, next: Next) -> Result<Response> {
+        let authorization = req.headers().get(AUTHORIZATION);
+        let report_api_key_auth = async move {
+            let Some(report_api_key_value) = authorization else {
+                warn!("Missing Authorization header");
+                unauthorized!();
+            };
+
+            let Ok(report_api_key_value) = report_api_key_value.to_str() else {
+                warn!("Failed to parse Authorization header value as string");
+                unauthorized!();
+            };
+
+            let (account_id, key_id) =
+                match ReportApiKey::validate_value(report_api_key_value).await {
+                    Ok((account_id, key_id)) => (account_id, key_id),
+                    Err(err) => {
+                        warn!(?err, "Failed to validate report key value");
+                        unauthorized!();
+                    }
+                };
+
+            Result::Ok(ReportApiKeyAuth { account_id, key_id })
+        }
+        .instrument(error_span!("authenticate"))
+        .await?;
+
+        tracing::Span::current().record("auth", tracing::field::debug(&report_api_key_auth));
+
+        req.extensions_mut().insert(report_api_key_auth);
+
+        Ok(next.run(req).await)
     }
 
-    async fn validate(&self, db: &Surreal<Any>) -> Result<()> {
+    #[instrument(err, level = "error", skip_all)]
+    async fn _authenticate(req: &Request) -> Result<ReportApiKeyAuth> {
+        let Some(report_api_key_value) = req.headers().get(AUTHORIZATION) else {
+            warn!("Missing Authorization header");
+            unauthorized!();
+        };
+
+        let Ok(report_api_key_value) = report_api_key_value.to_str() else {
+            warn!("Failed to parse Authorization header value as string");
+            unauthorized!();
+        };
+
+        let (account_id, key_id) = match ReportApiKey::validate_value(report_api_key_value).await {
+            Ok((account_id, key_id)) => (account_id, key_id),
+            Err(err) => {
+                warn!(?err, "Failed to validate report key value");
+                unauthorized!();
+            }
+        };
+
+        Ok(ReportApiKeyAuth { account_id, key_id })
+    }
+
+    pub(crate) fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub(crate) async fn validate_account_access(&self, db: &Surreal<Any>) -> Result<()> {
         let Some(response) = db
             .query(BeginReadonlyStatement)
             .report_api_key_is_valid_query(self.key_id)
@@ -231,51 +269,22 @@ impl AccountAuth for ReportApiKeyAuth {
             .take::<Option<ReportApiKeyIsValidQueryResponse>>(0)?
         else {
             warn!(
-                "Report key {key_id} does not exist in account {account_id:?}",
                 key_id = self.key_id,
-                account_id = self.account_id
+                account_id = self.account_id,
+                "Report key does not exist in account database",
             );
             unauthorized!();
         };
 
         if !response.is_valid() {
             warn!(
-                "Report key {key_id} was revoked in account {account_id:?}",
                 key_id = self.key_id,
-                account_id = self.account_id
+                account_id = self.account_id,
+                "Report key was revoked in account database",
             );
             unauthorized!();
         }
 
         Ok(())
     }
-}
-
-pub(crate) async fn report_api_key_auth(mut req: Request, next: Next) -> Result<Response> {
-    let Some(report_api_key_value) = req.headers().get(AUTHORIZATION) else {
-        warn!("Missing Authorization header");
-        unauthorized!();
-    };
-
-    let Ok(report_api_key_value) = report_api_key_value.to_str() else {
-        warn!("Failed to parse Authorization header value as string");
-        unauthorized!();
-    };
-
-    let (account_id, key_id) = match ReportApiKey::validate_value(report_api_key_value).await {
-        Ok((account_id, key_id)) => (account_id, key_id),
-        Err(err) => {
-            warn!("Failed to validate report key value: {err:#?}");
-            unauthorized!();
-        }
-    };
-
-    info!("Validated report key value for account ID {account_id:?} and key ID {key_id}");
-
-    req.extensions_mut().insert(ReportApiKeyAuth {
-        account_id: account_id.clone(),
-        key_id,
-    });
-
-    Ok(next.run(req).await)
 }

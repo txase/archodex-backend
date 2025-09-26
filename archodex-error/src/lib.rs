@@ -6,7 +6,6 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Serialize;
-use tracing::error;
 
 #[derive(Debug)]
 pub struct PublicError {
@@ -66,22 +65,7 @@ where
             };
         }
 
-        if err.is::<surrealdb::Error>() {
-            match err.downcast::<surrealdb::Error>() {
-                Ok(surrealdb::Error::Db(surrealdb::error::Db::Ds(msg))) => {
-                    // Log SurrealDB datastore error messages directly
-                    error!("SurrealDB Datastore error: {msg}");
-                }
-                Ok(err) => {
-                    error!("SurrealDB error: {err:#?}");
-                }
-                Err(err) => {
-                    error!("Failed to downcast SurrealDB error: {err:#?}");
-                }
-            }
-        } else {
-            error!("Unhandled error: {err:#?}");
-        }
+        eprintln!("{err:?}\n\n");
 
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

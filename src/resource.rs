@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use surrealdb::{Surreal, engine::any::Any};
 
 use archodex_error::{anyhow, bail, ensure};
+
+use crate::account::Account;
 
 #[derive(Clone, Debug, Eq, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -301,13 +302,16 @@ pub(super) struct SetTagsRequest {
 }
 
 pub(super) async fn set_environments(
-    Extension(db): Extension<Surreal<Any>>,
+    Extension(account): Extension<Account>,
     Json(req): Json<SetTagsRequest>,
 ) -> crate::Result<()> {
     const QUERY: &str =
         "BEGIN; UPDATE resource SET environments = $envs WHERE id = $resource_id; COMMIT;";
 
-    db.query(QUERY)
+    account
+        .resources_db()
+        .await?
+        .query(QUERY)
         .bind(("envs", req.environments))
         .bind((
             "resource_id",

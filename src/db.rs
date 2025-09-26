@@ -1,22 +1,31 @@
-use std::{collections::HashMap, sync::LazyLock};
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
-use axum::{Extension, extract::Request, middleware::Next, response::Response};
+use axum::{
+    Extension,
+    extract::{Path, Request},
+    middleware::Next,
+    response::Response,
+};
 use surrealdb::{
     Surreal,
     engine::any::Any,
     opt::{Config, capabilities::Capabilities},
     sql::statements::CommitStatement,
 };
-use tokio::sync::{OnceCell, RwLock};
-use tracing::{info, warn};
+use tokio::sync::{Mutex, OnceCell, RwLock};
+use tracing::{info, instrument, warn};
 
 use crate::{
     Result,
     account::{Account, AccountQueries},
-    auth::AccountAuth,
+    auth::{DashboardAuth, ReportApiKeyAuth},
     env::Env,
 };
-use archodex_error::anyhow::{self, Context as _, anyhow, bail};
+use archodex_error::{
+    anyhow::{self, Context as _},
+    not_found,
+};
 
 #[derive(Default)]
 pub(crate) struct BeginReadonlyStatement;
@@ -38,121 +47,84 @@ impl surrealdb::opt::IntoQuery for BeginReadonlyStatement {
     }
 }
 
+#[instrument(err)]
 pub(crate) async fn migrate_service_data_database(
     service_data_surrealdb_url: &str,
     archodex_account_id: &str,
 ) -> anyhow::Result<()> {
-    info!(
-        "Migrating 'resources' database for account {archodex_account_id} at URL {service_data_surrealdb_url}...",
-    );
+    info!("Migrating service data 'resources' database...");
 
     // We can migrate using the backend API role and the resource policy set
     // above. But the resource policy can take 30+ seconds to propagate.
     // Instead, we'll use the customer data management role to migrate the
     // database.
-    let db = db_for_customer_data_account(
-        service_data_surrealdb_url,
-        archodex_account_id,
-    )
+    let db = resources_db(service_data_surrealdb_url, archodex_account_id)
         .await
-        .with_context(|| format!("Failed to get SurrealDB client for URL {service_data_surrealdb_url} for account {archodex_account_id}"))?;
+        .context("Failed to get SurrealDB client")?;
+
+    #[cfg(not(feature = "archodex-com"))]
+    db.query("DEFINE DATABASE resources;")
+        .await?
+        .check()
+        .context("Failed to define 'resources' SurrealDB database")?;
 
     migrator::migrate_account_resources_database(&db)
         .await
-        .with_context(|| format!("Failed to migrate 'resources' database for URL {service_data_surrealdb_url} for account {archodex_account_id}"))?;
+        .context("Failed to migrate 'resources' database")?;
 
-    info!(
-        "SurrealDB Database at {service_data_surrealdb_url} for account {archodex_account_id} migrated and ready for use"
-    );
+    info!("Service data SurrealDB Database 'resources' migrated and ready for use");
 
     Ok(())
 }
 
-pub(crate) async fn db_for_customer_data_account(
-    service_data_surrealdb_url: &str,
-    archodex_account_id: &str,
-) -> anyhow::Result<Surreal<Any>> {
-    static DBS_BY_URL: LazyLock<RwLock<HashMap<String, Surreal<Any>>>> =
-        LazyLock::new(|| RwLock::new(HashMap::new()));
+#[derive(PartialEq)]
+enum ArchodexSurrealDatabase {
+    Accounts,
+    Resources,
+}
 
-    let dbs_by_url = DBS_BY_URL.read().await;
+struct NonconcurrentDBState {
+    connection: Surreal<Any>,
+    current_database: ArchodexSurrealDatabase,
+}
 
-    let db = if let Some(db) = dbs_by_url.get(service_data_surrealdb_url) {
-        db.clone()
-    } else {
-        drop(dbs_by_url);
+#[instrument(err)]
+async fn get_nonconcurrent_db_connection(
+    url: &str,
+) -> anyhow::Result<&'static Mutex<NonconcurrentDBState>> {
+    static NONCONCURRENT_DB: OnceCell<Mutex<NonconcurrentDBState>> = OnceCell::const_new();
 
-        let mut dbs_by_url = DBS_BY_URL.write().await;
-
-        if let Some(db) = dbs_by_url.get(service_data_surrealdb_url) {
-            db.clone()
-        } else {
+    NONCONCURRENT_DB
+        .get_or_try_init(|| async {
             let db = surrealdb::engine::any::connect((
-                service_data_surrealdb_url,
+                url,
                 Config::default()
                     .capabilities(Capabilities::default().with_live_query_notifications(false))
                     .strict(),
             ))
             .await?;
 
-            dbs_by_url.insert(service_data_surrealdb_url.to_string(), db.clone());
+            if let Some(creds) = Env::surrealdb_creds() {
+                db.signin(creds)
+                    .await
+                    .context("Failed to sign in to SurrealDB with SURREALDB_USERNAME and SURREALDB_PASSWORD environment values")?;
+            }
 
-            db
-        }
-    };
+            db.use_ns("archodex").use_db("accounts").await?;
 
-    if let Some(creds) = Env::surrealdb_creds() {
-        db.signin(creds)
-            .await
-            .with_context(|| format!("Failed to sign in to SurrealDB instance {service_data_surrealdb_url} with SURREALDB_USERNAME and SURREALDB_PASSWORD environment values"))?;
-    }
-
-    db.use_ns(format!("a{archodex_account_id}"))
-        .use_db("resources")
-        .await?;
-
-    Ok(db)
+            anyhow::Ok(Mutex::new(NonconcurrentDBState { connection: db, current_database: ArchodexSurrealDatabase::Accounts }))
+        })
+        .await
 }
 
-pub(crate) async fn db<A: AccountAuth>(
-    Extension(auth): Extension<A>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response> {
-    let Some(account_id) = auth.account_id() else {
-        bail!("Missing account ID in auth extension");
-    };
-
-    let account = accounts_db()
-        .await?
-        .query(BeginReadonlyStatement)
-        .get_account_by_id(account_id.to_owned())
-        .query(CommitStatement::default())
-        .await?
-        .check_first_real_error()?
-        .take::<Option<Account>>(0)
-        .with_context(|| format!("Failed to get record for account ID {account_id:?}"))?
-        .ok_or_else(|| anyhow!("Account record not found for ID {account_id:?}"))?;
-
-    let db = account.surrealdb_client().await?;
-
-    auth.validate(&db).await?;
-
-    req.extensions_mut().insert(db);
-
-    Ok(next.run(req).await)
-}
-
-pub(crate) async fn accounts_db() -> anyhow::Result<Surreal<Any>> {
+#[instrument(err)]
+async fn get_concurrent_db_connection(url: &str) -> anyhow::Result<Surreal<Any>> {
     static ACCOUNTS_DB: OnceCell<Surreal<Any>> = OnceCell::const_new();
 
     Ok(ACCOUNTS_DB
         .get_or_try_init(|| async {
             let db = surrealdb::engine::any::connect((
-                #[cfg(feature = "archodex-com")]
-                Env::accounts_surrealdb_url(),
-                #[cfg(not(feature = "archodex-com"))]
-                Env::surrealdb_url(),
+                url,
                 Config::default()
                     .capabilities(Capabilities::default().with_live_query_notifications(false))
                     .strict(),
@@ -171,6 +143,175 @@ pub(crate) async fn accounts_db() -> anyhow::Result<Surreal<Any>> {
         })
         .await?
         .clone())
+}
+
+pub(crate) enum DBConnection {
+    Nonconcurrent(tokio::sync::MappedMutexGuard<'static, Surreal<Any>>),
+    Concurrent(Surreal<Any>),
+}
+
+impl std::ops::Deref for DBConnection {
+    type Target = Surreal<Any>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            DBConnection::Nonconcurrent(db) => db,
+            DBConnection::Concurrent(db) => db,
+        }
+    }
+}
+
+#[instrument(err)]
+pub(crate) async fn accounts_db() -> Result<DBConnection> {
+    #[cfg(feature = "archodex-com")]
+    let surrealdb_url = Env::accounts_surrealdb_url();
+    #[cfg(not(feature = "archodex-com"))]
+    let surrealdb_url = Env::surrealdb_url();
+
+    if !cfg!(feature = "archodex-com") && surrealdb_url.starts_with("rocksdb:") {
+        let connection = get_nonconcurrent_db_connection(surrealdb_url).await?;
+        let mut db_state = connection.lock().await;
+
+        if db_state.current_database != ArchodexSurrealDatabase::Accounts {
+            db_state.connection.use_db("accounts").await?;
+            db_state.current_database = ArchodexSurrealDatabase::Accounts;
+        }
+
+        Ok(DBConnection::Nonconcurrent(
+            tokio::sync::MutexGuard::try_map(db_state, |state| Some(&mut state.connection))
+                .unwrap_or_else(|_| unreachable!()),
+        ))
+    } else {
+        Ok(DBConnection::Concurrent(
+            get_concurrent_db_connection(surrealdb_url).await?,
+        ))
+    }
+}
+
+#[instrument(err)]
+pub(crate) async fn resources_db(
+    service_data_surrealdb_url: &str,
+    account_id: &str,
+) -> anyhow::Result<DBConnection> {
+    static DBS_BY_URL: LazyLock<RwLock<HashMap<String, Surreal<Any>>>> =
+        LazyLock::new(|| RwLock::new(HashMap::new()));
+
+    if !cfg!(feature = "archodex-com") && service_data_surrealdb_url.starts_with("rocksdb:") {
+        let connection = get_nonconcurrent_db_connection(service_data_surrealdb_url).await?;
+        let mut db_state = connection.lock().await;
+
+        if db_state.current_database != ArchodexSurrealDatabase::Resources {
+            db_state.connection.use_db("resources").await?;
+            db_state.current_database = ArchodexSurrealDatabase::Resources;
+        }
+
+        Ok(DBConnection::Nonconcurrent(
+            tokio::sync::MutexGuard::try_map(db_state, |state| Some(&mut state.connection))
+                .unwrap_or_else(|_| unreachable!()),
+        ))
+    } else {
+        let dbs_by_url = DBS_BY_URL.read().await;
+
+        let db = if let Some(db) = dbs_by_url.get(service_data_surrealdb_url) {
+            db.clone()
+        } else {
+            drop(dbs_by_url);
+
+            let mut dbs_by_url = DBS_BY_URL.write().await;
+
+            if let Some(db) = dbs_by_url.get(service_data_surrealdb_url) {
+                db.clone()
+            } else {
+                let db = surrealdb::engine::any::connect((
+                    service_data_surrealdb_url,
+                    Config::default()
+                        .capabilities(Capabilities::default().with_live_query_notifications(false))
+                        .strict(),
+                ))
+                .await?;
+
+                dbs_by_url.insert(service_data_surrealdb_url.to_string(), db.clone());
+
+                db
+            }
+        };
+
+        if let Some(creds) = Env::surrealdb_creds() {
+            db.signin(creds)
+                .await
+                .with_context(|| format!("Failed to sign in to SurrealDB instance {service_data_surrealdb_url} with SURREALDB_USERNAME and SURREALDB_PASSWORD environment values"))?;
+        }
+
+        let namespace = if cfg!(feature = "archodex-com") {
+            format!("a{account_id}")
+        } else {
+            "archodex".to_string()
+        };
+
+        db.use_ns(namespace).use_db("resources").await?;
+
+        Ok(DBConnection::Concurrent(db))
+    }
+}
+
+#[instrument(err, skip_all)]
+pub(crate) async fn dashboard_auth_account(
+    Extension(auth): Extension<DashboardAuth>,
+    Path(params): Path<HashMap<String, String>>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response> {
+    let account_id = params
+        .get("account_id")
+        .expect(":account_id should be in path for dashboard account authentication");
+
+    auth.validate_account_access(account_id).await?;
+
+    let account = accounts_db()
+        .await?
+        .query(BeginReadonlyStatement)
+        .get_account_by_id(account_id.to_owned())
+        .query(CommitStatement::default())
+        .await?
+        .check_first_real_error()?
+        .take::<Option<Account>>(0)
+        .with_context(|| format!("Failed to get record for account ID {account_id:?}"))?;
+
+    let Some(account) = account else {
+        not_found!("Account not found");
+    };
+
+    req.extensions_mut().insert(account);
+
+    Ok(next.run(req).await)
+}
+
+#[instrument(err, skip_all)]
+pub(crate) async fn report_api_key_account(
+    Extension(auth): Extension<ReportApiKeyAuth>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response> {
+    let account = accounts_db()
+        .await?
+        .query(BeginReadonlyStatement)
+        .get_account_by_id(auth.account_id().to_owned())
+        .query(CommitStatement::default())
+        .await?
+        .check_first_real_error()?
+        .take::<Option<Account>>(0)
+        .context("Failed to get account record")?;
+
+    let Some(account) = account else {
+        not_found!("Account not found");
+    };
+
+    auth.validate_account_access(&*(account.resources_db().await?))
+        .await?;
+
+    req.extensions_mut().insert(account);
+
+    Ok(next.run(req).await)
 }
 
 // Like surrealdb::Response::check, but skips over QueryNotExecuted errors.

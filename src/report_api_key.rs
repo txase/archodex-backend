@@ -72,7 +72,7 @@ impl ReportApiKey {
         let nonce = Aes128Gcm::generate_nonce(&mut rand::rngs::OsRng);
 
         let message = proto::ReportApiKeyEncryptedContents {
-            account_id: account_id.parse::<u32>().context("Invalid account ID")?,
+            account_id: account_id.parse::<u64>().context("Invalid account ID")?,
         };
 
         let aad = proto::ReportApiKeyEncryptedAad {

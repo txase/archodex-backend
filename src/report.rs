@@ -5,7 +5,6 @@ use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use surrealdb::{
-    Surreal,
     engine::any::Any,
     method::Query,
     sql::statements::{BeginStatement, CommitStatement, InsertStatement, UpdateStatement},
@@ -14,6 +13,7 @@ use tracing::info;
 
 use crate::{
     Result,
+    account::Account,
     db::QueryCheckFirstRealError,
     next_binding,
     resource::{ResourceId, ResourceIdPart, surrealdb_thing_from_resource_id},
@@ -286,9 +286,11 @@ fn upsert_events(mut query: Query<'_, Any>, report: EventCapture) -> Query<'_, A
 }
 
 pub(crate) async fn report(
-    Extension(db): Extension<Surreal<Any>>,
+    Extension(account): Extension<Account>,
     Json(req): Json<Request>,
 ) -> Result<()> {
+    let db = account.resources_db().await?;
+
     let mut query = db.query(BeginStatement::default());
 
     for resource_tree_node in req.resource_captures {

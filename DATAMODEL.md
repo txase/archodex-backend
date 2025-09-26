@@ -47,13 +47,16 @@ This table exists in both the global archodex.com environment and in self-hosted
 
 Account IDs are globally unique, even among self-hosted instances. When an account is self-hosted, the global archodex.com database account record contains only the information necessary to point the Archodex Dashboard to the self-hosted instance endpoint. The self-hosted environment contains the full account record in its database.
 
-| Field | Type | Assertions | Populated in global account table for self-hosted accounts? | Notes |
-| --- | --- | --- | --- | --- |
-| `id` | string | 10-digit numeric string, no leading zeros (i.e. >= `1000000000`) | ✅ | |
-| `endpoint` | string | Must be a valid URL | ✅ | API URL for this account. |
-| `service_data_surrealdb_url` | string | | | Connection string for the tenant's *resources* SurrealDB database store, and is also used for self-hosted *accounts* SurrealDB database store for self-hosted instances. |
-| `salt` | bytes | 16-byte length | | Salt used by agents to cryptographically hash Secret Values before transmitting to the account backend. |
-| `created_at` | datetime | | ✅ | Defaults to `time::now()` on creation. |
+| Field | Type | Assertions | Populated in global `account` table for managed accounts? | Populated in global `account` table for self-hosted accounts? | Populated in self-hosted `account` tables? | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | 10-digit numeric string, no leading zeros (i.e. >= `1000000000`) | ✅ | ✅ | ✅ | |
+| `endpoint` | string | Must be a valid URL | ✅ | ✅ | ✅ | API URL for this account. |
+| `service_data_surrealdb_url` | string | | ✅ | ❌ | ❌ | Connection string for the tenant's *resources* SurrealDB database store. |
+| `salt` | bytes | 16-byte length | ✅ | ❌ | ✅ | Salt used by agents to cryptographically hash Secret Values before transmitting to the account backend. |
+| `created_at` | datetime | | ✅ | ✅ | ✅ | Account creation timestamp. |
+| `created_by` | `user` record | | ✅ | ✅ | ✅ | User who created the account. |
+| `deleted_at` | datetime (optional) | | ✅ | ✅ | ✅ | Account deletion timestamp. Used to check if the account is active. |
+| `deleted_by` | `user` record (optional) | | ✅ | ✅ | ✅ | User who deleted the account. |
 
 ### Record Table: `user`
 

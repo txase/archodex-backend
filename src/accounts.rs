@@ -1,11 +1,9 @@
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use surrealdb::sql::statements::{BeginStatement, CommitStatement};
+use tracing::instrument;
 
-#[cfg(not(feature = "archodex-com"))]
-use surrealdb::{Surreal, engine::any::Any};
-
-use archodex_error::{anyhow::Context as _, conflict};
+use archodex_error::anyhow::Context as _;
 
 use crate::{
     Result,
@@ -43,6 +41,7 @@ pub(super) struct CreateAccountRequest {
     endpoint: Option<String>,
 }
 
+#[instrument(err, skip(auth))]
 pub(crate) async fn create_account(
     Extension(auth): Extension<DashboardAuth>,
     Json(req): Json<CreateAccountRequest>,
@@ -59,52 +58,56 @@ pub(crate) async fn create_account(
 }
 
 #[cfg(not(feature = "archodex-com"))]
+#[instrument(err, skip_all)]
 pub(crate) async fn create_local_account(
     auth: DashboardAuth,
     req: CreateAccountRequest,
 ) -> Result<Json<AccountPublic>> {
     let endpoint = Env::endpoint();
 
-    let accounts_db = accounts_db().await?;
-
-    verify_no_local_accounts_exist(&accounts_db).await?;
+    verify_no_local_accounts_exist().await?;
 
     let principal = auth.principal();
     principal.ensure_user_record_exists().await?;
 
-    let account = Account::new(endpoint.to_string(), Some(req.account_id))
+    let account = Account::new(endpoint.to_string(), req.account_id, principal.clone())
         .await
         .context("Failed to create new account")?;
 
-    accounts_db
+    accounts_db()
+        .await?
         .query(BeginStatement::default())
-        .create_account_query(&account)
+        .create_account_query(&account, principal)
         .add_account_access_for_user(&account, principal)
         .query(CommitStatement::default())
-        .await?
-        .check_first_real_error()?;
+        .await
+        .context("Failed to submit query to create new account record in accounts database")?
+        .check_first_real_error()
+        .context("Failed to create new account record in accounts database")?;
 
     Ok(Json(account.into()))
 }
 
 #[cfg(not(feature = "archodex-com"))]
-async fn verify_no_local_accounts_exist(accounts_db: &Surreal<Any>) -> Result<()> {
-    #[cfg(not(feature = "archodex-com"))]
+#[instrument(err, skip_all)]
+async fn verify_no_local_accounts_exist() -> Result<()> {
+    use archodex_error::{anyhow::anyhow, conflict};
+
     #[derive(Deserialize, PartialEq)]
     struct AccountsCount {
         count: u64,
     }
 
-    let accounts_count_results = accounts_db
-        .query("SELECT COUNT() FROM ONLY account")
+    let local_account_exists: bool = accounts_db()
+        .await?
+        .query("RETURN COUNT(SELECT id FROM account WHERE deleted_at IS NONE LIMIT 1) > 0")
         .await?
         .check_first_real_error()?
-        .take::<Option<AccountsCount>>(0)
-        .context("Failed to retrieve local accounts count")?;
+        .take::<Option<bool>>(0)
+        .context("Failed to retrieve local accounts count")?
+        .ok_or_else(|| anyhow!("Failed to retrieve local accounts count"))?;
 
-    if accounts_count_results.is_some()
-        && accounts_count_results != Some(AccountsCount { count: 0 })
-    {
+    if local_account_exists {
         conflict!("An account already exists for this local backend");
     }
 
@@ -127,22 +130,58 @@ pub(crate) async fn create_archodex_com_account(
     let principal = auth.principal();
     principal.ensure_user_record_exists().await?;
 
-    // TODO: Multi-account support
-    if principal.has_user_account().await? {
-        conflict!("User already has an account");
-    }
+    let next_account_id = principal.next_account_id().await?;
 
-    let account = Account::new(endpoint, None)
+    let account = Account::new(endpoint, next_account_id, principal.clone())
         .await
         .context("Failed to create new account")?;
 
     accounts_db
         .query(BeginStatement::default())
-        .create_account_query(&account)
+        .create_account_query(&account, principal)
         .add_account_access_for_user(&account, principal)
         .query(CommitStatement::default())
-        .await?
-        .check_first_real_error()?;
+        .await
+        .context("Failed to commit account creation transaction")?
+        .check_first_real_error()
+        .context("Failed to create new account record in accounts database")?;
 
     Ok(Json(account.into()))
+}
+
+#[instrument(err)]
+pub(crate) async fn delete_account(
+    Extension(auth): Extension<DashboardAuth>,
+    Extension(account): Extension<Account>,
+) -> Result<()> {
+    auth.principal().ensure_user_record_exists().await?;
+
+    let db = accounts_db().await?;
+
+    #[cfg(not(feature = "archodex-com"))]
+    {
+        db.query(BeginStatement::default())
+            .query("REMOVE DATABASE resources")
+            .query(CommitStatement::default())
+            .await
+            .context("Failed to submit query to delete data in resources database")?
+            .check_first_real_error()
+            .context("Failed to delete data in resources database")?;
+    }
+
+    #[cfg(feature = "archodex-com")]
+    if let Some(service_data_surrealdb_url) = account.service_data_surrealdb_url() {
+        archodex_com::delete_account_service_database(service_data_surrealdb_url, account.id())
+            .await?;
+    }
+
+    db.query(BeginStatement::default())
+        .delete_account_query(&account, auth.principal())
+        .query(CommitStatement::default())
+        .await
+        .context("Failed to submit query to delete account record in accounts database")?
+        .check_first_real_error()
+        .context("Failed to delete account record in accounts database")?;
+
+    Ok(())
 }

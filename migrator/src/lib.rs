@@ -6,11 +6,12 @@ use surrealdb::{
     engine::any::Any,
     opt::{Config, capabilities::Capabilities},
 };
-use tracing::info;
+use tracing::{info, instrument};
 
 /// # Errors
 ///
 /// Will return `Err` if the migration fails for any reason.
+#[instrument(err, skip_all)]
 pub async fn migrate_account_resources_database(db: &Surreal<Any>) -> Result<(), anyhow::Error> {
     const RESOURCES_SURQL: &str = include_str!("resources.surql");
 
@@ -26,6 +27,7 @@ pub async fn migrate_account_resources_database(db: &Surreal<Any>) -> Result<(),
 /// # Errors
 ///
 /// Will return `Err` if the migration fails for any reason.
+#[instrument(err, skip(creds))]
 pub async fn migrate_accounts_database(
     surrealdb_url: &str,
     creds: Option<surrealdb::opt::auth::Root<'_>>,

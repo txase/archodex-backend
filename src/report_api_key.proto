@@ -12,7 +12,7 @@ message ReportApiKey {
 
 // Encrypted with AES128-GCM.
 message ReportApiKeyEncryptedContents {
-  fixed32 account_id = 1;
+  fixed64 account_id = 1;
 }
 
 message ReportApiKeyEncryptedAAD {

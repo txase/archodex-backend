@@ -160,6 +160,11 @@ impl Env {
             archodex_com::api_private_key().await
         }
     }
+
+    #[cfg(feature = "archodex-com")]
+    pub(crate) fn user_account_limit() -> u32 {
+        5
+    }
 }
 
 fn env_with_default_for_empty(var: &str, default: &str) -> String {

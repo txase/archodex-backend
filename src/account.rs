@@ -1,25 +1,29 @@
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use surrealdb::{Surreal, engine::any::Any};
+use tracing::instrument;
 
 use crate::{
-    db::{db_for_customer_data_account, migrate_service_data_database},
+    db::{DBConnection, migrate_service_data_database, resources_db},
     env::Env,
     next_binding, surrealdb_deserializers,
     user::User,
 };
-use archodex_error::anyhow::{self, bail};
+use archodex_error::anyhow;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Account {
     #[serde(deserialize_with = "surrealdb_deserializers::string::deserialize")]
     id: String,
     endpoint: String,
+    #[cfg(feature = "archodex-com")]
     service_data_surrealdb_url: Option<String>,
     #[serde(deserialize_with = "surrealdb_deserializers::bytes::deserialize")]
     salt: Vec<u8>,
     created_at: Option<DateTime<Utc>>,
+    created_by: Option<User>,
+    deleted_at: Option<DateTime<Utc>>,
+    deleted_by: Option<User>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -38,15 +42,8 @@ impl From<Account> for AccountPublic {
 }
 
 impl Account {
-    pub(crate) async fn new(endpoint: String, account_id: Option<String>) -> anyhow::Result<Self> {
-        let id = if let Some(account_id) = account_id {
-            account_id
-        } else {
-            rand::thread_rng()
-                .gen_range::<u64, _>(1_000_000_000..=9_999_999_999)
-                .to_string()
-        };
-
+    #[instrument(err)]
+    pub(crate) async fn new(endpoint: String, id: String, principal: User) -> anyhow::Result<Self> {
         #[cfg(not(feature = "archodex-com"))]
         let service_data_surrealdb_url = Some(Env::surrealdb_url().to_string());
         #[cfg(feature = "archodex-com")]
@@ -63,51 +60,90 @@ impl Account {
         Ok(Self {
             id,
             endpoint,
+            #[cfg(feature = "archodex-com")]
             service_data_surrealdb_url,
             salt: rand::thread_rng().r#gen::<[u8; 16]>().to_vec(),
             created_at: None,
+            created_by: Some(principal),
+            deleted_at: None,
+            deleted_by: None,
         })
+    }
+
+    #[cfg(feature = "archodex-com")]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[cfg(feature = "archodex-com")]
+    pub(crate) fn service_data_surrealdb_url(&self) -> Option<&str> {
+        self.service_data_surrealdb_url.as_deref()
     }
 
     pub(crate) fn salt(&self) -> &[u8] {
         &self.salt
     }
 
-    pub(crate) async fn surrealdb_client(&self) -> anyhow::Result<Surreal<Any>> {
-        if let Some(service_data_surrealdb_url) = &self.service_data_surrealdb_url {
-            db_for_customer_data_account(service_data_surrealdb_url, &self.id).await
-        } else {
+    pub(crate) async fn resources_db(&self) -> anyhow::Result<DBConnection> {
+        #[cfg(not(feature = "archodex-com"))]
+        let service_data_surrealdb_url = Env::surrealdb_url();
+        #[cfg(feature = "archodex-com")]
+        let Some(service_data_surrealdb_url) = &self.service_data_surrealdb_url else {
+            use archodex_error::anyhow::bail;
+
             bail!(
                 "No service data SurrealDB URL configured for account {}",
                 self.id
             );
-        }
+        };
+
+        resources_db(service_data_surrealdb_url, &self.id).await
     }
 }
 
 pub(crate) trait AccountQueries<'r, C: surrealdb::Connection> {
-    fn create_account_query(self, account: &Account) -> surrealdb::method::Query<'r, C>;
+    fn create_account_query(
+        self,
+        account: &Account,
+        principal: &User,
+    ) -> surrealdb::method::Query<'r, C>;
     fn add_account_access_for_user(
         self,
         account: &Account,
         user: &User,
     ) -> surrealdb::method::Query<'r, C>;
     fn get_account_by_id(self, account_id: String) -> surrealdb::method::Query<'r, C>;
+    fn delete_account_query(
+        self,
+        account: &Account,
+        principal: &User,
+    ) -> surrealdb::method::Query<'r, C>;
 }
 
 impl<'r, C: surrealdb::Connection> AccountQueries<'r, C> for surrealdb::method::Query<'r, C> {
-    fn create_account_query(self, account: &Account) -> surrealdb::method::Query<'r, C> {
+    fn create_account_query(
+        self,
+        account: &Account,
+        principal: &User,
+    ) -> surrealdb::method::Query<'r, C> {
         let account_binding = next_binding();
         let endpoint_binding = next_binding();
         let service_data_surrealdb_url_binding = next_binding();
         let salt_binding = next_binding();
+        let created_by_binding = next_binding();
+
+        #[cfg(not(feature = "archodex-com"))]
+        let service_data_surrealdb_url_value = Option::<String>::None;
+        #[cfg(feature = "archodex-com")]
+        let service_data_surrealdb_url_value = account.service_data_surrealdb_url.clone();
 
         self
-            .query(format!("CREATE ${account_binding} CONTENT {{ endpoint: ${endpoint_binding}, service_data_surrealdb_url: ${service_data_surrealdb_url_binding}, salt: ${salt_binding} }} RETURN NONE"))
+            .query(format!("CREATE ${account_binding} CONTENT {{ endpoint: ${endpoint_binding}, service_data_surrealdb_url: ${service_data_surrealdb_url_binding}, salt: ${salt_binding}, created_by: ${created_by_binding} }} RETURN NONE"))
             .bind((account_binding, surrealdb::sql::Thing::from(account)))
             .bind((endpoint_binding, account.endpoint.clone()))
-            .bind((service_data_surrealdb_url_binding, account.service_data_surrealdb_url.clone()))
+            .bind((service_data_surrealdb_url_binding, service_data_surrealdb_url_value))
             .bind((salt_binding, surrealdb::sql::Bytes::from(account.salt.clone())))
+            .bind((created_by_binding, surrealdb::sql::Thing::from(principal)))
     }
 
     fn add_account_access_for_user(
@@ -133,6 +169,22 @@ impl<'r, C: surrealdb::Connection> AccountQueries<'r, C> for surrealdb::method::
                 account_binding,
                 surrealdb::sql::Thing::from(("account", surrealdb::sql::Id::String(account_id))),
             ))
+    }
+
+    fn delete_account_query(
+        self,
+        account: &Account,
+        principal: &User,
+    ) -> surrealdb::method::Query<'r, C> {
+        let account_binding = next_binding();
+        let deleted_by_binding = next_binding();
+
+        self.query(format!("UPDATE ${account_binding} CONTENT {{ deleted_at: time::now(), deleted_by: ${deleted_by_binding} }}"))
+            .bind((
+                account_binding,
+                surrealdb::sql::Thing::from(account)
+            ))
+            .bind((deleted_by_binding, surrealdb::sql::Thing::from(principal)))
     }
 }
 

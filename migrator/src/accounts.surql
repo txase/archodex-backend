@@ -10,6 +10,9 @@ DEFINE FIELD OVERWRITE service_data_surrealdb_url ON TABLE account TYPE option<s
 DEFINE FIELD IF NOT EXISTS salt ON TABLE account TYPE bytes READONLY
   ASSERT bytes::len($this.salt) == 16;
 DEFINE FIELD IF NOT EXISTS created_at ON TABLE account TYPE datetime READONLY DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS created_by ON TABLE account TYPE record<user> READONLY;
+DEFINE FIELD IF NOT EXISTS deleted_at ON TABLE account TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS deleted_by ON TABLE account TYPE option<record<user>>;
 
 DEFINE TABLE IF NOT EXISTS user SCHEMAFULL TYPE NORMAL;
 DEFINE FIELD IF NOT EXISTS id ON TABLE user TYPE uuid READONLY;
